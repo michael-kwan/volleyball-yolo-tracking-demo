@@ -58,27 +58,82 @@ def extract_middle(src, dst, duration=10):
 def detect_court_lines_and_poly(frame):
     h, w = frame.shape[:2]
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lower_white = np.array([0, 0, 180])
-    upper_white = np.array([180, 60, 255])
-    lower_yellow = np.array([20, 80, 140])
-    upper_yellow = np.array([40, 255, 255])
-    mask = cv2.bitwise_or(
-        cv2.inRange(hsv, lower_white, upper_white),
-        cv2.inRange(hsv, lower_yellow, upper_yellow),
-    )
+    # White paint only – no yellow to avoid crowd shirts, wood reflections, net tape artifacts.
+    # Lowered value threshold vs v2 to catch faded paint, but tight saturation.
+    lower_white = np.array([0, 0, 160])
+    upper_white = np.array([180, 70, 255])
+    mask = cv2.inRange(hsv, lower_white, upper_white)
+    # ignore top 22% where bleachers / crowd create horizontal clutter
+    mask[: int(h * 0.22), :] = 0
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, 1)  # remove speckles
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, 2)  # connect dashes
     mask = cv2.dilate(mask, kernel, 1)
     edges = cv2.Canny(mask, 50, 150)
+    # Hough voting – not RANSAC, but similar outlier rejection via threshold
     lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 60, minLineLength=60, maxLineGap=20)
-    line_list = []
+    raw_list = []
     if lines is not None:
         for l in lines:
             x1, y1, x2, y2 = l if len(l) == 4 else l[0]
-            if np.hypot(x2 - x1, y2 - y1) > 40:
-                line_list.append((x1, y1, x2, y2))
+            length = np.hypot(x2 - x1, y2 - y1)
+            if length < 80:
+                continue
+            angle = np.degrees(np.arctan2(y2 - y1, x2 - x1)) % 180
+            # keep near-horizontal for sidelines / attack lines in this side view perspective
+            # allow 0±20 deg and also slanted 153 deg range which appears in this camera angle
+            if not ((angle < 20 or angle > 160) or (60 < angle < 120)):
+                continue
+            if max(y1, y2) < h * 0.3:  # too high = bleachers
+                continue
+            if min(y1, y2) > h * 0.97:  # too low edge noise
+                continue
+            raw_list.append(
+                (int(x1), int(y1), int(x2), int(y2), float(length), float(angle))
+            )
+
+    # cluster to suppress duplicate detections causing "bunch of horizontal yellow lines" artifact
+    def cluster_lines(lines_in, is_horizontal=True, tol=18):
+        if not lines_in:
+            return []
+        # sort by average y for horiz, average x for vert
+        if is_horizontal:
+            sorted_l = sorted(lines_in, key=lambda x: (x[1] + x[3]) / 2)
+        else:
+            sorted_l = sorted(lines_in, key=lambda x: (x[0] + x[2]) / 2)
+        clusters = []
+        for l in sorted_l:
+            coord = (l[1] + l[3]) / 2 if is_horizontal else (l[0] + l[2]) / 2
+            if not clusters or abs(coord - clusters[-1][0]) > tol:
+                clusters.append([coord, [l]])
+            else:
+                clusters[-1][1].append(l)
+                # update centroid
+                coords = [
+                    (x[1] + x[3]) / 2 if is_horizontal else (x[0] + x[2]) / 2
+                    for x in clusters[-1][1]
+                ]
+                clusters[-1][0] = float(np.mean(coords))
+        # pick longest per cluster as representative -> clean single line not spaghetti
+        rep = []
+        for _, members in clusters:
+            longest = max(members, key=lambda x: x[4])
+            rep.append(longest[:4])  # x1,y1,x2,y2
+        return rep
+
+    horiz = [l for l in raw_list if l[5] < 20 or l[5] > 160]
+    vert = [l for l in raw_list if 60 < l[5] < 120]
+    # also include slanted near-horizontal ~140-160 deg as horiz cluster with wider tol
+    slanted = [l for l in raw_list if 140 < l[5] < 160]
+    horiz.extend(slanted)
+
+    h_rep = cluster_lines(horiz, True, tol=16)
+    v_rep = cluster_lines(vert, False, tol=22)
+    line_list = h_rep + v_rep  # typically 4-10 clean lines vs 80+ noisy before
+
+    # poly from ALL raw points for robustness, not just clustered reps
     pts = []
-    for x1, y1, x2, y2 in line_list:
+    for x1, y1, x2, y2, _, _ in raw_list:
         pts.append([x1, y1])
         pts.append([x2, y2])
     poly = None
@@ -89,6 +144,29 @@ def detect_court_lines_and_poly(frame):
             hull = cv2.convexHull(pts_f)
             approx = cv2.approxPolyDP(hull, 0.02 * cv2.arcLength(hull, True), True)
             poly = approx.reshape(-1, 2)
+            # fallback check area too small -> use default court ROI rectangle
+            area = cv2.contourArea(poly) if len(poly) >= 3 else 0
+            if area < w * h * 0.15:  # less than 15% image area unrealistic for court
+                poly = np.array(
+                    [
+                        [int(w * 0.02), int(h * 0.3)],
+                        [int(w * 0.98), int(h * 0.25)],
+                        [int(w * 0.98), int(h * 0.92)],
+                        [int(w * 0.02), int(h * 0.95)],
+                    ],
+                    dtype=np.int32,
+                )
+    if poly is None:
+        # default fallback rectangle covering typical court area in side view
+        poly = np.array(
+            [
+                [int(w * 0.02), int(h * 0.3)],
+                [int(w * 0.98), int(h * 0.25)],
+                [int(w * 0.98), int(h * 0.92)],
+                [int(w * 0.02), int(h * 0.95)],
+            ],
+            dtype=np.int32,
+        )
     return line_list, poly
 
 
@@ -189,16 +267,16 @@ def main():
         ann = frame.copy()
         if court_lines:
             for x1, y1, x2, y2 in court_lines:
-                cv2.line(ann, (x1, y1), (x2, y2), (0, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(ann, (x1, y1), (x2, y2), (255, 255, 255), 1, cv2.LINE_AA)
         if court_poly is not None:
-            cv2.polylines(ann, [court_poly], True, (0, 200, 255), 2)
+            cv2.polylines(ann, [court_poly], True, (255, 0, 255), 2)
             cv2.putText(
                 ann,
                 "Court ROI",
                 (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
-                (0, 200, 255),
+                (255, 0, 255),
                 2,
             )
         if res.boxes is not None and res.boxes.id is not None:
